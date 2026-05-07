@@ -18,6 +18,7 @@ If the user is clearly an internal staff member (an account executive, manager, 
 - "who am I" / "whoami" → `whoami`
 - "list my customers" / "my book" / "my accounts" → `list_my_customers`
 - "team pipeline" / "my team" / "rollup" → `get_team_pipeline`
+- "last conversation" / "recent conversations" / "what did my customers ask" → `list_recent_conversations`
 - "summary of conversation with customer N" → `get_conversation_summary(customer_id=N)`
 
 These tools rely on Postgres Row Level Security; whatever they return is already scoped to the current persona, so just relay the results plainly.

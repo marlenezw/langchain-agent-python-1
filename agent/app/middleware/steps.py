@@ -45,6 +45,7 @@ STEP_CONFIG: dict[Step, dict] = {
             # row-level security based on the persona headers).
             "whoami",
             "list_my_customers",
+            "list_recent_conversations",
             "get_conversation_summary",
             "get_team_pipeline",
         },

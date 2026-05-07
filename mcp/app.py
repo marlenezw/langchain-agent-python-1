@@ -637,15 +637,57 @@ async def list_my_customers(
     return json.dumps(rows, default=str, indent=2)
 
 
+@mcp.tool(annotations={"title": "List Recent Conversations", "readOnlyHint": True, "openWorldHint": False})
+async def list_recent_conversations(
+    ctx: Context,
+    max_rows: Annotated[int, Field(description="Max conversations to return", ge=1, le=100)] = 10,
+) -> str:
+    """Return the most recent conversations visible to the current persona.
+
+    Use this for phrases like 'show my last conversation', 'recent
+    customer chats', 'what was the last thing my customers asked'. Row
+    Level Security automatically filters to:
+      - Customer: only their own conversations
+      - AE: only conversations for their assigned customers
+      - Manager: conversations across all AEs they manage
+      - Admin: everything
+    Each row includes the customer_id so you can call
+    get_conversation_summary(customer_id) for full detail.
+    """
+    if not db_provider:
+        raise ToolError("Database not configured.")
+    rows = await db_provider.execute_query(
+        """
+        SELECT
+          conv.conversation_id,
+          conv.customer_id,
+          c.customer_name,
+          conv.intent,
+          conv.summary,
+          conv.started_at,
+          conv.ended_at
+        FROM retail.conversations conv
+        JOIN retail.customers c ON c.customer_id = conv.customer_id
+        ORDER BY conv.started_at DESC
+        LIMIT $1;
+        """,
+        max_rows,
+    )
+    if not rows:
+        return "No conversations visible to this persona."
+    return json.dumps(rows, default=str, indent=2)
+
+
 @mcp.tool(annotations={"title": "Get Conversation Summary", "readOnlyHint": True, "openWorldHint": False})
 async def get_conversation_summary(
     customer_id: Annotated[int, Field(description="Customer to fetch the latest conversation for")],
     ctx: Context,
 ) -> str:
-    """Return the latest conversation summary + activity log for a customer.
+    """Return the latest conversation summary + activity log for one customer.
 
-    This is exactly the payload an AE sees on handoff — RLS guarantees the
-    AE can only ever read summaries for customers assigned to them.
+    RLS guarantees the persona can only ever read summaries for customers
+    they're authorised to see. If you don't know which customer to ask
+    about, call list_recent_conversations() first.
     """
     if not db_provider:
         raise ToolError("Database not configured.")
