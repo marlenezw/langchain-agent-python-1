@@ -78,6 +78,27 @@
   header .step-indicator.muted { color: var(--text-dim); }
   header .step-indicator.muted::before { background: var(--text-dim); box-shadow: none; }
 
+  /* Persona switcher (top-right of header). The selected persona drives
+     X-Sales-Role / X-Sales-Actor-Id headers on every MCP call so that
+     Postgres Row Level Security scopes which rows the agent can read. */
+  header .persona {
+    display: inline-flex; align-items: center; gap: 8px;
+    padding: 4px 10px;
+    background: var(--frost-2); border: 1px solid var(--frost-stroke); border-radius: 999px;
+    font-size: 12px;
+  }
+  header .persona label {
+    font-size: 11px; font-weight: 600; letter-spacing: 0.04em; text-transform: uppercase;
+    color: var(--text-dim);
+  }
+  header .persona select {
+    background: transparent; color: var(--text); border: none; outline: none;
+    font: inherit; font-weight: 600; padding: 4px 4px 4px 0;
+    cursor: pointer; max-width: 200px;
+  }
+  header .persona select option { background: #0b1020; color: var(--text); }
+  header .header-controls { display: inline-flex; align-items: center; gap: 12px; }
+
   .thread {
     overflow-y: auto; padding: 8px 4px 8px 4px; scroll-behavior: smooth;
     display: flex; flex-direction: column; gap: 12px;
@@ -270,7 +291,13 @@
       <div class="logo"></div>
       <div class="title">Zava Sales<small>LangChain v1 handoffs · Azure OpenAI · MCP</small></div>
     </div>
-    <div class="step-indicator muted" id="step-indicator">step: greet</div>
+    <div class="header-controls">
+      <div class="persona" title="Postgres Row Level Security scopes data based on this persona">
+        <label for="persona-select">Persona</label>
+        <select id="persona-select"><option value="admin">Admin (bypass RLS)</option></select>
+      </div>
+      <div class="step-indicator muted" id="step-indicator">step: greet</div>
+    </div>
   </header>
 
   <div class="thread" id="thread"></div>
@@ -420,6 +447,47 @@
   let debugCount = 0;
   let currentDebugTurn = null;
 
+  // --- Persona switcher ---------------------------------------------------
+  // The selected persona is sent on every /api/chat request and forwarded
+  // to the MCP server as X-Sales-Role / X-Sales-Actor-Id headers, where
+  // Postgres RLS policies decide which rows are visible.
+  let persona = { role: "admin", actor_id: "0", label: "Admin (bypass RLS)" };
+  const personaSelect = document.getElementById("persona-select");
+  let personaList = [];
+
+  async function loadPersonas() {
+    try {
+      const res = await fetch("/api/personas");
+      if (!res.ok) return;
+      const data = await res.json();
+      personaList = data.personas || [];
+      personaSelect.innerHTML = "";
+      for (const p of personaList) {
+        const opt = document.createElement("option");
+        opt.value = p.key;
+        opt.textContent = p.label;
+        personaSelect.appendChild(opt);
+      }
+      const initial = personaList.find((p) => p.key === (data.default || "admin")) || personaList[0];
+      if (initial) {
+        personaSelect.value = initial.key;
+        persona = { role: initial.role, actor_id: initial.actor_id, label: initial.label };
+      }
+    } catch (_) { /* keep defaults */ }
+  }
+  personaSelect.addEventListener("change", () => {
+    const p = personaList.find((x) => x.key === personaSelect.value);
+    if (!p) return;
+    persona = { role: p.role, actor_id: p.actor_id, label: p.label };
+    // New thread per persona so the agent doesn't blend memory across roles.
+    threadId = null;
+    history = [];
+    document.getElementById("thread").innerHTML = "";
+    document.getElementById("first-suggestions").style.display = "";
+    pushDebug("step", "persona →", `${p.role} (id=${p.actor_id})`);
+  });
+  loadPersonas();
+
   function pad(n) { return n < 10 ? "0" + n : "" + n; }
   function ts() {
     const d = new Date();
@@ -555,6 +623,8 @@ What brings you to Zava today?`;
           message: text,
           history: history.slice(0, -1),
           thread_id: threadId,
+          role: persona.role,
+          actor_id: persona.actor_id,
         }),
       });
       if (!res.ok) {

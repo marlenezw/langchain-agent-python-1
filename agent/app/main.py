@@ -86,18 +86,19 @@ async def lifespan(app: Starlette):
 
     main_model, nano_model, credential = build_models()
 
-    mcp_client = MultiServerMCPClient(
-        {"zava-sales": {"url": MCP_SERVER_URL, "transport": "streamable_http"}}
-    )
-    mcp_tools = await _connect_mcp_with_retry(mcp_client)
+    # Cache one (mcp_client, mcp_tools, agent) per persona key. Personas
+    # are switched from the UI dropdown; the persona's role + actor id
+    # become headers on every MCP call so Postgres RLS can scope rows.
+    app.state.persona_cache = {}
+    app.state.persona_lock = asyncio.Lock()
+    app.state.main_model = main_model
+    app.state.nano_model = nano_model
 
-    agent = build_agent(main_model, nano_model, mcp_tools)
-
-    app.state.agent = agent
-    app.state.mcp_tool_count = len(mcp_tools)
+    # Warm the default 'admin' persona so first request is fast.
+    await _get_or_build_agent(app, "admin", "0")
     app.state.local_tool_count = len(LOCAL_TOOLS)
     app.state.ready = True
-    logger.info("✅ Agent ready (%d local + %d MCP tools)", len(LOCAL_TOOLS), len(mcp_tools))
+    logger.info("✅ Agent ready (default admin persona warmed)")
 
     try:
         yield
@@ -108,6 +109,39 @@ async def lifespan(app: Starlette):
             pass
 
 
+async def _get_or_build_agent(app: Starlette, role: str, actor_id: str):
+    """Return a cached (agent, mcp_tool_count) for the persona, building if needed."""
+    key = (role, actor_id)
+    cached = app.state.persona_cache.get(key)
+    if cached is not None:
+        return cached
+
+    async with app.state.persona_lock:
+        cached = app.state.persona_cache.get(key)
+        if cached is not None:
+            return cached
+
+        client = MultiServerMCPClient(
+            {
+                "zava-sales": {
+                    "url": MCP_SERVER_URL,
+                    "transport": "streamable_http",
+                    "headers": {
+                        "X-Sales-Role": role,
+                        "X-Sales-Actor-Id": str(actor_id),
+                    },
+                }
+            }
+        )
+        tools = await _connect_mcp_with_retry(client)
+        agent = build_agent(app.state.main_model, app.state.nano_model, tools)
+        cached = {"agent": agent, "mcp_tool_count": len(tools), "client": client}
+        app.state.persona_cache[key] = cached
+        logger.info("🪪 Built agent for persona role=%s actor=%s (%d tools)",
+                    role, actor_id, len(tools))
+        return cached
+
+
 # ---- Routes ---------------------------------------------------------------
 async def index(request):
     return FileResponse(STATIC_DIR / "index.html", media_type="text/html")
@@ -116,6 +150,7 @@ async def index(request):
 async def health(request):
     state = request.app.state
     ready = getattr(state, "ready", False)
+    default_persona = state.persona_cache.get(("admin", "0")) if ready else None
     return JSONResponse(
         {
             "status": "healthy" if ready else "starting",
@@ -123,10 +158,33 @@ async def health(request):
             "environment": ENVIRONMENT,
             "mcp_server": MCP_SERVER_URL,
             "local_tool_count": getattr(state, "local_tool_count", 0),
-            "mcp_tool_count": getattr(state, "mcp_tool_count", 0),
+            "mcp_tool_count": (default_persona or {}).get("mcp_tool_count", 0),
+            "personas_cached": len(getattr(state, "persona_cache", {})),
         },
         status_code=200 if ready else 503,
     )
+
+
+# Personas the UI dropdown can switch to. Kept in lock-step with what
+# data/generate_database.py seeds. Pure presentation — Postgres RLS is
+# what actually enforces the scoping.
+PERSONAS = [
+    {"key": "admin",       "role": "admin",    "actor_id": "0", "label": "Admin (bypass RLS)"},
+    {"key": "manager-1",   "role": "manager",  "actor_id": "1", "label": "Manager · Maria Chen"},
+    {"key": "manager-2",   "role": "manager",  "actor_id": "2", "label": "Manager · Marcus Johnson"},
+    {"key": "ae-1",        "role": "ae",       "actor_id": "1", "label": "AE · Sarah Patel"},
+    {"key": "ae-2",        "role": "ae",       "actor_id": "2", "label": "AE · Tom Rivera"},
+    {"key": "ae-3",        "role": "ae",       "actor_id": "3", "label": "AE · Aisha Khan"},
+    {"key": "ae-4",        "role": "ae",       "actor_id": "4", "label": "AE · Diego Romero"},
+    {"key": "customer-1",  "role": "customer", "actor_id": "1", "label": "Customer #1"},
+    {"key": "customer-2",  "role": "customer", "actor_id": "2", "label": "Customer #2"},
+    {"key": "customer-3",  "role": "customer", "actor_id": "3", "label": "Customer #3"},
+    {"key": "customer-4",  "role": "customer", "actor_id": "4", "label": "Customer #4"},
+]
+
+
+async def personas(request):
+    return JSONResponse({"personas": PERSONAS, "default": "admin"})
 
 
 async def chat(request):
@@ -142,6 +200,14 @@ async def chat(request):
     message = body.get("message")
     if not message:
         return JSONResponse({"error": "message is required"}, status_code=400)
+
+    role = (body.get("role") or "admin").lower()
+    actor_id = str(body.get("actor_id") or "0")
+    if role not in {"admin", "manager", "ae", "customer"}:
+        return JSONResponse({"error": f"unknown role '{role}'"}, status_code=400)
+
+    persona = await _get_or_build_agent(request.app, role, actor_id)
+    agent = persona["agent"]
 
     history = body.get("history") or []
     thread_id = body.get("thread_id") or str(uuid.uuid4())
@@ -170,7 +236,7 @@ async def chat(request):
         text_by_msg: dict[str, str] = {}
 
         try:
-            async for chunk in state.agent.astream(
+            async for chunk in agent.astream(
                 initial_state, config, stream_mode="messages"
             ):
                 # stream_mode="messages" yields (AIMessageChunk, metadata) tuples.
@@ -247,6 +313,7 @@ routes = [
     Route("/", index, methods=["GET"]),
     Route("/api/chat", chat, methods=["POST"]),
     Route("/api/health", health, methods=["GET"]),
+    Route("/api/personas", personas, methods=["GET"]),
 ]
 
 app = Starlette(debug=False, routes=routes, lifespan=lifespan)

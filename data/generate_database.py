@@ -209,13 +209,33 @@ class DatabaseGenerator:
                 );
             """)
 
-            # Create customers table
+            # Create managers table (sales managers supervise AEs)
+            await self.conn.execute("""
+                CREATE TABLE IF NOT EXISTS retail.managers (
+                    manager_id SERIAL PRIMARY KEY,
+                    manager_name VARCHAR(200) NOT NULL,
+                    email VARCHAR(200) NOT NULL UNIQUE
+                );
+            """)
+
+            # Create account_executives table
+            await self.conn.execute("""
+                CREATE TABLE IF NOT EXISTS retail.account_executives (
+                    ae_id SERIAL PRIMARY KEY,
+                    ae_name VARCHAR(200) NOT NULL,
+                    email VARCHAR(200) NOT NULL UNIQUE,
+                    manager_id INTEGER REFERENCES retail.managers(manager_id)
+                );
+            """)
+
+            # Create customers table — assigned_ae_id is the RLS pivot
             await self.conn.execute("""
                 CREATE TABLE IF NOT EXISTS retail.customers (
                     customer_id SERIAL PRIMARY KEY,
                     customer_name VARCHAR(200),
                     email VARCHAR(200),
                     phone VARCHAR(50),
+                    assigned_ae_id INTEGER REFERENCES retail.account_executives(ae_id),
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 );
             """)
@@ -252,6 +272,44 @@ class DatabaseGenerator:
                     quantity_on_hand INTEGER,
                     last_updated TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     UNIQUE(product_id, store_id)
+                );
+            """)
+
+            # Conversations table — one row per agent chat session.
+            # Customer scopes their own row; the assigned AE (and that AE's
+            # manager) can also read it via RLS policies further down.
+            await self.conn.execute("""
+                CREATE TABLE IF NOT EXISTS retail.conversations (
+                    conversation_id SERIAL PRIMARY KEY,
+                    customer_id INTEGER NOT NULL REFERENCES retail.customers(customer_id),
+                    started_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    ended_at TIMESTAMP,
+                    intent VARCHAR(100),
+                    summary TEXT
+                );
+            """)
+
+            # Per-turn message log (append-only).
+            await self.conn.execute("""
+                CREATE TABLE IF NOT EXISTS retail.messages (
+                    message_id SERIAL PRIMARY KEY,
+                    conversation_id INTEGER NOT NULL REFERENCES retail.conversations(conversation_id),
+                    customer_id INTEGER NOT NULL REFERENCES retail.customers(customer_id),
+                    role VARCHAR(32) NOT NULL,
+                    content TEXT NOT NULL,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                );
+            """)
+
+            # Activity log captured at handoff and any other notable moment.
+            await self.conn.execute("""
+                CREATE TABLE IF NOT EXISTS retail.activity_log (
+                    log_id SERIAL PRIMARY KEY,
+                    customer_id INTEGER NOT NULL REFERENCES retail.customers(customer_id),
+                    conversation_id INTEGER REFERENCES retail.conversations(conversation_id),
+                    event_type VARCHAR(64) NOT NULL,
+                    payload JSONB,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 );
             """)
 
@@ -674,6 +732,308 @@ class DatabaseGenerator:
             f"✅ Loaded {len(orders)} orders with {len(all_order_items)} items from JSON"
         )
 
+    # ---- Sales-team seeding + RLS ---------------------------------------
+    # The Zava sample uses a 4-persona security model:
+    #   admin     — bypass (ops / debug only)
+    #   manager   — sees customers assigned to AEs they manage
+    #   ae        — sees customers assigned to them
+    #   customer  — sees only their own row
+    # All scoping is via two GUCs that the MCP server sets per request:
+    #   app.current_role, app.current_actor_id.
+
+    async def seed_sales_team(self, sample_customers: int = 80):
+        """Insert a tiny but realistic sales team and assign customers to AEs.
+
+        Keeps the demo small (2 managers, 4 AEs). Spreads the first
+        `sample_customers` rows across the 4 AEs round-robin so every AE has
+        something to look at. Customers beyond `sample_customers` are left
+        unassigned (NULL assigned_ae_id) — those will only be visible to
+        admins, which makes the RLS demo punchier.
+        """
+        logger.info("Seeding sales team (managers, account executives)...")
+
+        await self.conn.execute(
+            """
+            INSERT INTO retail.managers (manager_id, manager_name, email) VALUES
+              (1, 'Maria Chen',      'maria.chen@zava.example'),
+              (2, 'Marcus Johnson',  'marcus.j@zava.example')
+            ON CONFLICT (manager_id) DO NOTHING
+            """
+        )
+        await self.conn.execute(
+            """
+            INSERT INTO retail.account_executives (ae_id, ae_name, email, manager_id) VALUES
+              (1, 'Sarah Patel',  'sarah.p@zava.example',  1),
+              (2, 'Tom Rivera',   'tom.r@zava.example',    1),
+              (3, 'Aisha Khan',   'aisha.k@zava.example',  2),
+              (4, 'Diego Romero', 'diego.r@zava.example',  2)
+            ON CONFLICT (ae_id) DO NOTHING
+            """
+        )
+        await self.conn.execute(
+            """
+            SELECT setval('retail.managers_manager_id_seq', 2, true);
+            """
+        )
+        await self.conn.execute(
+            """
+            SELECT setval('retail.account_executives_ae_id_seq', 4, true);
+            """
+        )
+
+        # Round-robin assign the first N customers to AEs.
+        await self.conn.execute(
+            """
+            WITH ranked AS (
+              SELECT customer_id, ROW_NUMBER() OVER (ORDER BY customer_id) AS rn
+              FROM retail.customers
+              LIMIT $1
+            )
+            UPDATE retail.customers c
+            SET assigned_ae_id = ((ranked.rn - 1) % 4) + 1
+            FROM ranked
+            WHERE c.customer_id = ranked.customer_id
+            """,
+            sample_customers,
+        )
+
+        # Seed a few sample conversations + messages + activity_log entries
+        # so AEs/managers immediately see content when they switch persona.
+        scripted = [
+            (
+                1,
+                "pricing",
+                "Customer asked about Pro vs Enterprise pricing for a 12-seat team. "
+                "Comfortable with monthly billing but prefers annual if there is a "
+                "10% discount. Decision-maker confirmed; budget approved for Q2.",
+                [
+                    ("user", "Hi! Looking at Zava for our team of 12. What does Pro cost?"),
+                    ("assistant", "Pro is $24/seat/month or $20/seat on annual billing."),
+                    ("user", "Any discount if we sign annual today?"),
+                    ("assistant", "I can offer 10% off year one — that takes you to $18/seat."),
+                ],
+            ),
+            (
+                2,
+                "objection",
+                "Concerned about migration effort from current vendor. Wants a "
+                "case study from a similar team and a 30-day pilot. Strong intent.",
+                [
+                    ("user", "We're worried about migration time."),
+                    ("assistant", "Most teams your size finish in under two weeks; "
+                                  "I can share a property-management case study."),
+                    ("user", "Yes please — and can we pilot first?"),
+                    ("assistant", "Absolutely. Let me set up a 30-day pilot with full features."),
+                ],
+            ),
+            (
+                3,
+                "book",
+                "Qualified mid-market lead. Wants a kickoff call with the AE next week. "
+                "Two stakeholders attending. Pricing already approved internally.",
+                [
+                    ("user", "Can we book a call for Tuesday?"),
+                    ("assistant", "Tuesday at 11am PT works — calendar invite on the way."),
+                ],
+            ),
+            (
+                4,
+                "education",
+                "Prospect evaluating Zava for property-management workflows. Wants "
+                "to understand integrations, especially with their existing CRM. "
+                "Not yet ready to talk price.",
+                [
+                    ("user", "How does Zava integrate with HubSpot?"),
+                    ("assistant", "Zava ships a native two-way HubSpot connector "
+                                  "for contacts and deals; I can walk you through it."),
+                ],
+            ),
+        ]
+        for customer_id, intent, summary, msgs in scripted:
+            convo_id = await self.conn.fetchval(
+                """
+                INSERT INTO retail.conversations
+                  (customer_id, ended_at, intent, summary)
+                VALUES ($1, CURRENT_TIMESTAMP, $2, $3)
+                RETURNING conversation_id
+                """,
+                customer_id,
+                intent,
+                summary,
+            )
+            for role, content in msgs:
+                await self.conn.execute(
+                    """
+                    INSERT INTO retail.messages
+                      (conversation_id, customer_id, role, content)
+                    VALUES ($1, $2, $3, $4)
+                    """,
+                    convo_id,
+                    customer_id,
+                    role,
+                    content,
+                )
+            await self.conn.execute(
+                """
+                INSERT INTO retail.activity_log
+                  (customer_id, conversation_id, event_type, payload)
+                VALUES ($1, $2, 'handoff_to_ae',
+                        jsonb_build_object('intent', $3::text, 'summary', $4::text))
+                """,
+                customer_id,
+                convo_id,
+                intent,
+                summary,
+            )
+
+        logger.info(
+            "✅ Sales team seeded: 2 managers, 4 AEs, %d customers assigned, "
+            "4 sample conversations + activity log",
+            sample_customers,
+        )
+
+    async def apply_rls_policies(self):
+        """Enable Row Level Security and create policies for tenant tables.
+
+        Uses two GUCs the MCP server sets per request:
+          - app.current_role     ('admin' | 'manager' | 'ae' | 'customer')
+          - app.current_actor_id (text representation of the actor's id)
+
+        Also creates an `mcp_app` non-superuser role. The MCP server does
+        `SET LOCAL ROLE mcp_app` on every connection checkout — without
+        that the policies would be silently bypassed by the Postgres
+        superuser. FORCE ROW LEVEL SECURITY is still set so even if a
+        future operator connects as the `mcp_app`-owning user the policies
+        keep applying.
+        """
+        logger.info("Applying Row Level Security policies...")
+
+        # Non-superuser role the MCP server adopts via SET LOCAL ROLE.
+        # NOLOGIN — nobody connects as mcp_app directly; we SET ROLE to it.
+        await self.conn.execute(
+            """
+            DO $$ BEGIN
+              IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'mcp_app') THEN
+                CREATE ROLE mcp_app NOLOGIN;
+              END IF;
+            END $$;
+            """
+        )
+        await self.conn.execute("GRANT USAGE ON SCHEMA retail TO mcp_app")
+        await self.conn.execute("GRANT SELECT ON ALL TABLES IN SCHEMA retail TO mcp_app")
+        await self.conn.execute(
+            "GRANT INSERT, UPDATE ON retail.conversations, retail.messages, retail.activity_log TO mcp_app"
+        )
+        await self.conn.execute(
+            "GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA retail TO mcp_app"
+        )
+        # Allow whichever user the API connects as to SET ROLE mcp_app.
+        await self.conn.execute(
+            "GRANT mcp_app TO CURRENT_USER"
+        )
+
+        # One reusable predicate for every customer-scoped table.
+        # SECURITY DEFINER so the function runs as its (superuser) owner and
+        # bypasses RLS internally — otherwise the function's own SELECT
+        # against retail.customers would trigger the policy that calls
+        # the function, recursing until stack overflow.
+        await self.conn.execute(
+            """
+            CREATE OR REPLACE FUNCTION retail.can_see_customer(target_customer INT)
+            RETURNS BOOLEAN
+            LANGUAGE sql STABLE
+            SECURITY DEFINER
+            SET search_path = retail, pg_temp
+            AS $$
+              SELECT
+                current_setting('app.current_role', true) = 'admin'
+                OR (
+                  current_setting('app.current_role', true) = 'customer'
+                  AND target_customer::text = current_setting('app.current_actor_id', true)
+                )
+                OR EXISTS (
+                  SELECT 1
+                  FROM retail.customers c
+                  LEFT JOIN retail.account_executives ae ON ae.ae_id = c.assigned_ae_id
+                  WHERE c.customer_id = target_customer
+                    AND (
+                      (current_setting('app.current_role', true) = 'ae'
+                        AND ae.ae_id::text = current_setting('app.current_actor_id', true))
+                      OR (current_setting('app.current_role', true) = 'manager'
+                        AND ae.manager_id::text = current_setting('app.current_actor_id', true))
+                    )
+                );
+            $$;
+            """
+        )
+        # Lock down execution to the app role.
+        await self.conn.execute(
+            "REVOKE ALL ON FUNCTION retail.can_see_customer(INT) FROM PUBLIC"
+        )
+        await self.conn.execute(
+            "GRANT EXECUTE ON FUNCTION retail.can_see_customer(INT) TO mcp_app"
+        )
+
+        # Tables scoped per customer.
+        scoped_tables = [
+            "customers",
+            "orders",
+            "conversations",
+            "messages",
+            "activity_log",
+        ]
+        for tbl in scoped_tables:
+            await self.conn.execute(f"ALTER TABLE retail.{tbl} ENABLE ROW LEVEL SECURITY")
+            await self.conn.execute(f"ALTER TABLE retail.{tbl} FORCE ROW LEVEL SECURITY")
+
+        # Customers policy uses customer_id directly.
+        await self.conn.execute(
+            """
+            DROP POLICY IF EXISTS rls_customers ON retail.customers;
+            CREATE POLICY rls_customers ON retail.customers
+              USING (retail.can_see_customer(customer_id));
+            """
+        )
+        # Per-customer tables share the same shape.
+        for tbl in ("orders", "conversations", "messages", "activity_log"):
+            await self.conn.execute(
+                f"""
+                DROP POLICY IF EXISTS rls_{tbl} ON retail.{tbl};
+                CREATE POLICY rls_{tbl} ON retail.{tbl}
+                  USING (retail.can_see_customer(customer_id));
+                """
+            )
+
+        # order_items has no customer_id column — gate via the parent order.
+        await self.conn.execute(
+            """
+            ALTER TABLE retail.order_items ENABLE ROW LEVEL SECURITY;
+            ALTER TABLE retail.order_items FORCE ROW LEVEL SECURITY;
+            DROP POLICY IF EXISTS rls_order_items ON retail.order_items;
+            CREATE POLICY rls_order_items ON retail.order_items
+              USING (
+                EXISTS (
+                  SELECT 1 FROM retail.orders o
+                  WHERE o.order_id = retail.order_items.order_id
+                    AND retail.can_see_customer(o.customer_id)
+                )
+              );
+            """
+        )
+
+        # AE/manager directories — readable by anyone authenticated, no row scoping.
+        for tbl in ("managers", "account_executives"):
+            await self.conn.execute(f"ALTER TABLE retail.{tbl} ENABLE ROW LEVEL SECURITY")
+            await self.conn.execute(f"ALTER TABLE retail.{tbl} FORCE ROW LEVEL SECURITY")
+            await self.conn.execute(
+                f"""
+                DROP POLICY IF EXISTS rls_{tbl} ON retail.{tbl};
+                CREATE POLICY rls_{tbl} ON retail.{tbl} USING (true);
+                """
+            )
+
+        logger.info("✅ Row Level Security enabled on customer-scoped tables")
+
     async def generate_customers(
         self, num_customers: int = 5000, reference_data: dict = None
     ):
@@ -1070,6 +1430,11 @@ async def main():
 
         # Create indexes AFTER loading all data (5-10x faster)
         await generator.create_indexes()
+
+        # Seed sales team and apply Row Level Security AFTER all data is in.
+        # RLS gets applied last so seed scripts run unconstrained.
+        await generator.seed_sales_team()
+        await generator.apply_rls_policies()
 
         logger.info("=" * 60)
         logger.info("✅ Database generation completed successfully!")

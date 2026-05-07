@@ -41,6 +41,12 @@ STEP_CONFIG: dict[Step, dict] = {
             "escalate_to_ae",
             # MCP
             "search_case_studies",
+            # MCP - RLS-aware introspection (visible filtered by Postgres
+            # row-level security based on the persona headers).
+            "whoami",
+            "list_my_customers",
+            "get_conversation_summary",
+            "get_team_pipeline",
         },
     },
     "qualify": {

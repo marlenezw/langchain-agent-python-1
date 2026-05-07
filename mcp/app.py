@@ -23,6 +23,7 @@ import logging
 import os
 import re
 from contextlib import asynccontextmanager
+from contextvars import ContextVar
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Annotated, Optional
@@ -70,6 +71,17 @@ def _safe_dsn(url: str) -> str:
     return f"{scheme}{quote(user, safe='')}:{quote(password, safe='')}@{rest}"
 
 
+# ---- RLS context (per-request) ------------------------------------------
+# The agent forwards two HTTP headers to every MCP call:
+#   X-Sales-Role     : 'admin' | 'manager' | 'ae' | 'customer'
+#   X-Sales-Actor-Id : numeric id of the actor (manager_id / ae_id / customer_id)
+# A Starlette middleware below stores them in these contextvars; the
+# rls_acquire() helper sets the matching Postgres GUCs on every checkout
+# so the policies in retail.* fire automatically.
+RLS_ROLE: ContextVar[str] = ContextVar("rls_role", default="admin")
+RLS_ACTOR: ContextVar[str] = ContextVar("rls_actor", default="0")
+
+
 # ---- Postgres provider ---------------------------------------------------
 class PostgreSQLProvider:
     def __init__(self, dsn: str):
@@ -91,10 +103,36 @@ class PostgreSQLProvider:
             await self.pool.close()
             logger.info("PostgreSQL connection pool closed")
 
-    async def execute_query(self, query: str, *args) -> list[dict]:
+    @asynccontextmanager
+    async def rls_acquire(self):
+        """Acquire a pooled connection with the current request's RLS context applied.
+
+        Reads RLS_ROLE / RLS_ACTOR contextvars (populated by the HTTP
+        middleware) and inside a transaction:
+          1. `SET LOCAL ROLE mcp_app` so the connection runs as a non-
+             superuser and Postgres actually enforces RLS policies (the
+             default `postgres` superuser bypasses RLS entirely).
+          2. `set_config(..., true)` on `app.current_role` /
+             `app.current_actor_id` so policy predicates filter rows.
+
+        Both `SET LOCAL` and `set_config(..., true)` reset at transaction
+        end, so the connection is returned to the pool clean.
+        """
         if not self.pool:
             await self.connect()
         async with self.pool.acquire() as conn:
+            async with conn.transaction():
+                await conn.execute("SET LOCAL ROLE mcp_app")
+                await conn.execute(
+                    "SELECT set_config('app.current_role', $1, true), "
+                    "set_config('app.current_actor_id', $2, true)",
+                    RLS_ROLE.get(),
+                    str(RLS_ACTOR.get()),
+                )
+                yield conn
+
+    async def execute_query(self, query: str, *args) -> list[dict]:
+        async with self.rls_acquire() as conn:
             rows = await conn.fetch(query, *args)
             return [dict(row) for row in rows]
 
@@ -341,7 +379,7 @@ async def semantic_search_products(
     LIMIT $3;
     """
 
-    async with db_provider.pool.acquire() as conn:
+    async with db_provider.rls_acquire() as conn:
         rows = await conn.fetch(sql, pg_vec, threshold, max_rows)
     if not rows:
         return f"No products found matching '{query}' with similarity > {threshold}."
@@ -428,7 +466,7 @@ async def search_case_studies(
     ORDER BY embedding <=> $1::vector
     LIMIT ${len(args)};
     """
-    async with db_provider.pool.acquire() as conn:
+    async with db_provider.rls_acquire() as conn:
         rows = await conn.fetch(sql, *args)
     if not rows:
         return f"No case studies matched '{query}'."
@@ -559,8 +597,136 @@ async def compare_plans(
     )
 
 
+# ---- AE / Manager tools (RLS-scoped) ------------------------------------
+# These tools deliberately don't take an actor id — Postgres Row Level
+# Security filters rows based on the X-Sales-Role / X-Sales-Actor-Id headers
+# the agent forwards on every MCP request.
+
+@mcp.tool(annotations={"title": "Who Am I", "readOnlyHint": True, "openWorldHint": False})
+async def whoami(ctx: Context) -> str:
+    """Return the role + actor id RLS will use for this request.
+
+    Useful for debugging persona switching from the UI.
+    """
+    return json.dumps({"role": RLS_ROLE.get(), "actor_id": RLS_ACTOR.get()})
+
+
+@mcp.tool(annotations={"title": "List My Customers", "readOnlyHint": True, "openWorldHint": False})
+async def list_my_customers(
+    ctx: Context,
+    max_rows: Annotated[int, Field(description="Max rows to return", ge=1, le=200)] = 25,
+) -> str:
+    """List customers visible to the current persona (filtered by RLS).
+
+    AEs see customers assigned to them; managers see customers across their
+    AEs; customers see only themselves; admin sees everyone.
+    """
+    if not db_provider:
+        raise ToolError("Database not configured.")
+    sql = """
+    SELECT c.customer_id, c.customer_name, c.email, c.assigned_ae_id,
+           ae.ae_name AS ae_name
+    FROM retail.customers c
+    LEFT JOIN retail.account_executives ae ON ae.ae_id = c.assigned_ae_id
+    ORDER BY c.customer_id
+    LIMIT $1;
+    """
+    rows = await db_provider.execute_query(sql, max_rows)
+    if not rows:
+        return "No customers visible to this persona."
+    return json.dumps(rows, default=str, indent=2)
+
+
+@mcp.tool(annotations={"title": "Get Conversation Summary", "readOnlyHint": True, "openWorldHint": False})
+async def get_conversation_summary(
+    customer_id: Annotated[int, Field(description="Customer to fetch the latest conversation for")],
+    ctx: Context,
+) -> str:
+    """Return the latest conversation summary + activity log for a customer.
+
+    This is exactly the payload an AE sees on handoff — RLS guarantees the
+    AE can only ever read summaries for customers assigned to them.
+    """
+    if not db_provider:
+        raise ToolError("Database not configured.")
+    convo_rows = await db_provider.execute_query(
+        """
+        SELECT conversation_id, intent, summary, started_at, ended_at
+        FROM retail.conversations
+        WHERE customer_id = $1
+        ORDER BY started_at DESC
+        LIMIT 1;
+        """,
+        customer_id,
+    )
+    if not convo_rows:
+        return f"No conversations visible for customer {customer_id}."
+    convo = convo_rows[0]
+    activity_rows = await db_provider.execute_query(
+        """
+        SELECT event_type, payload, created_at
+        FROM retail.activity_log
+        WHERE customer_id = $1
+        ORDER BY created_at DESC
+        LIMIT 20;
+        """,
+        customer_id,
+    )
+    return json.dumps(
+        {"conversation": convo, "activity_log": activity_rows},
+        default=str,
+        indent=2,
+    )
+
+
+@mcp.tool(annotations={"title": "Get Team Pipeline", "readOnlyHint": True, "openWorldHint": False})
+async def get_team_pipeline(ctx: Context) -> str:
+    """Manager-only roll-up: count of active customers per AE in the team.
+
+    For non-managers RLS will return zero rows.
+    """
+    if not db_provider:
+        raise ToolError("Database not configured.")
+    rows = await db_provider.execute_query(
+        """
+        SELECT ae.ae_id, ae.ae_name, COUNT(c.customer_id) AS customers
+        FROM retail.account_executives ae
+        LEFT JOIN retail.customers c ON c.assigned_ae_id = ae.ae_id
+        GROUP BY ae.ae_id, ae.ae_name
+        ORDER BY customers DESC, ae.ae_id;
+        """
+    )
+    return json.dumps(rows, default=str, indent=2)
+
+
+# ---- ASGI app + RLS header middleware -----------------------------------
+from starlette.middleware.base import BaseHTTPMiddleware  # noqa: E402
+
+
+class RLSContextMiddleware(BaseHTTPMiddleware):
+    """Read X-Sales-Role / X-Sales-Actor-Id from each HTTP request and store
+    them in contextvars so rls_acquire() can apply them to Postgres GUCs.
+
+    Defaults to ('admin', '0') — i.e. unrestricted — when headers are
+    absent. That matches local debugging via psql. The agent always sets
+    these explicitly in production traffic.
+    """
+
+    async def dispatch(self, request, call_next):
+        role = request.headers.get("x-sales-role", "admin").lower()
+        actor = request.headers.get("x-sales-actor-id", "0")
+        token_role = RLS_ROLE.set(role)
+        token_actor = RLS_ACTOR.set(actor)
+        try:
+            return await call_next(request)
+        finally:
+            RLS_ROLE.reset(token_role)
+            RLS_ACTOR.reset(token_actor)
+
+
 # Streamable-HTTP ASGI app
 app = mcp.http_app()
+app.add_middleware(RLSContextMiddleware)
 
 
 def run():
