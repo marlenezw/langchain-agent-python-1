@@ -927,6 +927,14 @@ class DatabaseGenerator:
         await self.conn.execute(
             "GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA retail TO mcp_app"
         )
+        # Future tables (e.g. seeded later by generate_sales_kb.py) should
+        # automatically be readable by the app role.
+        await self.conn.execute(
+            "ALTER DEFAULT PRIVILEGES IN SCHEMA retail GRANT SELECT ON TABLES TO mcp_app"
+        )
+        await self.conn.execute(
+            "ALTER DEFAULT PRIVILEGES IN SCHEMA retail GRANT USAGE, SELECT ON SEQUENCES TO mcp_app"
+        )
         # Allow whichever user the API connects as to SET ROLE mcp_app.
         await self.conn.execute(
             "GRANT mcp_app TO CURRENT_USER"
